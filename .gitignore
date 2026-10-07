@@ -1,0 +1,11 @@
+node_modules/
+dist/
+dist-cvm/
+*.db
+*.tsbuildinfo*
+.harness/
+.space-build/
+.space-build-cvm/
+.bun-cache/
+audits/
+.DS_Store
