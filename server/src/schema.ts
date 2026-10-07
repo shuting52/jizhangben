@@ -40,6 +40,11 @@ export const overtimeEntries = sqliteTable(
     multiplierHundredths: integer("multiplier_hundredths").notNull(),
     payCents: integer("pay_cents").notNull(),
     note: text("note").notNull().default(""),
+    startTime: text("start_time"),
+    endTime: text("end_time"),
+    breakMinutes: integer("break_minutes").notNull().default(0),
+    compensationType: text("compensation_type", { enum: ["pay", "time_off"] }).notNull().default("pay"),
+    status: text("status", { enum: ["pending", "settled"] }).notNull().default("pending"),
     createdAt: integer("created_at", { mode: "timestamp_ms" })
       .notNull()
       .$defaultFn(() => new Date()),

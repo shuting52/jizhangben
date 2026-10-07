@@ -41,6 +41,10 @@ const monthlyBudgetSchema = z.object({
   updated_at: z.string(),
 });
 
+const compensationTypeSchema = z.enum(["pay", "time_off"]);
+const overtimeStatusSchema = z.enum(["pending", "settled"]);
+const clockTimeSchema = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).nullable();
+
 const overtimeEntrySchema = z.object({
   id: z.number(),
   work_date: dateSchema,
@@ -49,7 +53,25 @@ const overtimeEntrySchema = z.object({
   multiplier_hundredths: z.number(),
   pay_cents: z.number(),
   note: z.string(),
+  start_time: clockTimeSchema,
+  end_time: clockTimeSchema,
+  break_minutes: z.number(),
+  compensation_type: compensationTypeSchema,
+  status: overtimeStatusSchema,
   created_at: z.string(),
+});
+
+const overtimeInputSchema = z.object({
+  work_date: dateSchema,
+  minutes: z.number().int().positive().max(1440),
+  hourly_rate_cents: z.number().int().min(0).max(99999999),
+  multiplier_hundredths: z.number().int().min(100).max(300),
+  note: z.string().trim().max(80),
+  start_time: clockTimeSchema,
+  end_time: clockTimeSchema,
+  break_minutes: z.number().int().min(0).max(720),
+  compensation_type: compensationTypeSchema,
+  status: overtimeStatusSchema,
 });
 
 export const Actions = {
@@ -180,6 +202,11 @@ export const Actions = {
           multiplier_hundredths: row.multiplierHundredths,
           pay_cents: row.payCents,
           note: row.note,
+          start_time: row.startTime,
+          end_time: row.endTime,
+          break_minutes: row.breakMinutes,
+          compensation_type: row.compensationType,
+          status: row.status,
           created_at: row.createdAt.toISOString(),
         })),
       };
@@ -187,16 +214,12 @@ export const Actions = {
   }),
 
   addOvertimeEntry: defineAction({
-    request: z.object({
-      work_date: dateSchema,
-      minutes: z.number().int().positive().max(1440),
-      hourly_rate_cents: z.number().int().min(0).max(99999999),
-      multiplier_hundredths: z.number().int().min(100).max(300),
-      note: z.string().trim().max(80),
-    }),
+    request: overtimeInputSchema,
     response: z.object({ id: z.number(), pay_cents: z.number() }),
     async handler(ctx, args) {
-      const payCents = Math.round((args.minutes / 60) * args.hourly_rate_cents * (args.multiplier_hundredths / 100));
+      const payCents = args.compensation_type === "pay"
+        ? Math.round((args.minutes / 60) * args.hourly_rate_cents * (args.multiplier_hundredths / 100))
+        : 0;
       const inserted = await ctx
         .db<typeof schema>()
         .insert(schema.overtimeEntries)
@@ -207,12 +230,52 @@ export const Actions = {
           multiplierHundredths: args.multiplier_hundredths,
           payCents,
           note: args.note,
+          startTime: args.start_time,
+          endTime: args.end_time,
+          breakMinutes: args.break_minutes,
+          compensationType: args.compensation_type,
+          status: args.status,
         })
         .returning({ id: schema.overtimeEntries.id });
       const row = inserted[0];
       if (!row) throw new Error("保存失败，请稍后再试");
       ctx.invalidateQueries();
       return { id: row.id, pay_cents: payCents };
+    },
+  }),
+
+  updateOvertimeEntry: defineAction({
+    request: overtimeInputSchema.extend({ id: z.number().int().positive() }),
+    response: z.object({ id: z.number(), pay_cents: z.number() }),
+    async handler(ctx, args): Promise<{ id: number; pay_cents: number }> {
+      const payCents = args.compensation_type === "pay"
+        ? Math.round((args.minutes / 60) * args.hourly_rate_cents * (args.multiplier_hundredths / 100))
+        : 0;
+      await ctx.db<typeof schema>().update(schema.overtimeEntries).set({
+        workDate: args.work_date,
+        minutes: args.minutes,
+        hourlyRateCents: args.hourly_rate_cents,
+        multiplierHundredths: args.multiplier_hundredths,
+        payCents,
+        note: args.note,
+        startTime: args.start_time,
+        endTime: args.end_time,
+        breakMinutes: args.break_minutes,
+        compensationType: args.compensation_type,
+        status: args.status,
+      }).where(eq(schema.overtimeEntries.id, args.id));
+      ctx.invalidateQueries();
+      return { id: args.id, pay_cents: payCents };
+    },
+  }),
+
+  setOvertimeStatus: defineAction({
+    request: z.object({ id: z.number().int().positive(), status: overtimeStatusSchema }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      await ctx.db<typeof schema>().update(schema.overtimeEntries).set({ status: args.status }).where(eq(schema.overtimeEntries.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
     },
   }),
 

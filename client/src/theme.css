@@ -136,6 +136,17 @@ button { -webkit-tap-highlight-color: transparent; }
   font-weight: 700;
 }
 .primary-wide:disabled { opacity: .4; }
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: .16rem .48rem;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 700;
+}
+.status-pending { background: rgba(233, 183, 83, .24); color: #684914; }
+.status-done { background: rgba(68, 122, 91, .18); color: #28583c; }
 
 @keyframes pulse-ring {
   0%, 100% { transform: scale(1); opacity: .45; }
@@ -184,6 +195,8 @@ button { -webkit-tap-highlight-color: transparent; }
     background: linear-gradient(150deg, rgba(15, 52, 84, .94), rgba(6, 29, 55, .9));
   }
   .glass-control { background: rgba(5, 27, 52, .46); }
+  .status-pending { background: rgba(240, 198, 108, .18); color: #ffe1a2; }
+  .status-done { background: rgba(112, 190, 145, .18); color: #aee2c3; }
 }
 
 @media (min-width: 768px) {
