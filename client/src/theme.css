@@ -147,7 +147,69 @@ button { -webkit-tap-highlight-color: transparent; }
 }
 .status-pending { background: rgba(233, 183, 83, .24); color: #684914; }
 .status-done { background: rgba(68, 122, 91, .18); color: #28583c; }
+.update-dot {
+  width: .42rem;
+  height: .42rem;
+  border-radius: 999px;
+  background: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 18%, transparent);
+}
+.update-sheet { overflow: hidden; }
+.update-symbol {
+  display: flex;
+  width: 3.25rem;
+  height: 3.25rem;
+  align-items: center;
+  justify-content: center;
+  border-radius: 17px;
+  background: var(--soft);
+  color: var(--text);
+}
+.update-symbol svg { width: 1.45rem; height: 1.45rem; }
+.update-symbol-update { background: var(--accent); color: var(--accent-ink); }
+.update-symbol-success { background: rgba(68, 122, 91, .18); color: #28583c; }
+.update-symbol-error { background: rgba(200, 58, 46, .15); color: var(--danger); }
+.calendar-day {
+  position: relative;
+  display: flex;
+  min-height: 2.8rem;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  border-radius: 11px;
+  color: var(--text);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.calendar-day small {
+  margin-top: .1rem;
+  color: var(--dim);
+  font-size: 8px;
+  line-height: 1;
+}
+.calendar-worked { background: var(--soft); font-weight: 700; }
+.calendar-worked::after {
+  content: "";
+  position: absolute;
+  top: .28rem;
+  right: .34rem;
+  width: .28rem;
+  height: .28rem;
+  border-radius: 999px;
+  background: var(--accent);
+}
+.calendar-today { box-shadow: inset 0 0 0 1.5px var(--accent); }
+.calendar-blank { opacity: 0; }
+.update-spinner {
+  width: 2rem;
+  height: 2rem;
+  border: 3px solid var(--soft);
+  border-top-color: var(--accent);
+  border-radius: 999px;
+  animation: update-spin .85s linear infinite;
+}
 
+@keyframes update-spin { to { transform: rotate(360deg); } }
 @keyframes pulse-ring {
   0%, 100% { transform: scale(1); opacity: .45; }
   50% { transform: scale(1.1); opacity: .12; }

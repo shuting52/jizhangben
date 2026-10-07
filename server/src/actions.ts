@@ -43,6 +43,7 @@ const monthlyBudgetSchema = z.object({
 
 const compensationTypeSchema = z.enum(["pay", "time_off"]);
 const overtimeStatusSchema = z.enum(["pending", "settled"]);
+const overtimeTypeSchema = z.enum(["workday", "rest_day", "holiday"]);
 const clockTimeSchema = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).nullable();
 
 const overtimeEntrySchema = z.object({
@@ -58,6 +59,9 @@ const overtimeEntrySchema = z.object({
   break_minutes: z.number(),
   compensation_type: compensationTypeSchema,
   status: overtimeStatusSchema,
+  overtime_type: overtimeTypeSchema,
+  allowance_cents: z.number(),
+  deduction_cents: z.number(),
   created_at: z.string(),
 });
 
@@ -72,9 +76,137 @@ const overtimeInputSchema = z.object({
   break_minutes: z.number().int().min(0).max(720),
   compensation_type: compensationTypeSchema,
   status: overtimeStatusSchema,
+  overtime_type: overtimeTypeSchema,
+  allowance_cents: z.number().int().min(0).max(99999999),
+  deduction_cents: z.number().int().min(0).max(99999999),
 });
 
+const overtimeSettingsSchema = z.object({
+  base_salary_cents: z.number(),
+  standard_days_hundredths: z.number(),
+  standard_hours_hundredths: z.number(),
+  calculated_hourly_rate_cents: z.number(),
+  updated_at: z.string().nullable(),
+});
+
+const activeShiftSchema = z.object({
+  work_date: dateSchema,
+  start_time: z.string(),
+  started_at: z.string(),
+  note: z.string(),
+  overtime_type: overtimeTypeSchema,
+  compensation_type: compensationTypeSchema,
+});
+
+const updateManifestSchema = z.object({
+  version: z.string().trim().min(1).max(40),
+  version_code: z.number().int().positive(),
+  title: z.string().trim().min(1).max(80),
+  notes: z.array(z.string().trim().min(1).max(160)).max(12),
+  apk_url: z.string().url().nullable(),
+  published_at: z.string().datetime().nullable().default(null),
+});
+
+const updateCheckResponseSchema = z.object({
+  status: z.enum(["up_to_date", "update_available", "manifest_missing", "package_pending", "check_failed"]),
+  message: z.string(),
+  checked_at: z.string(),
+  source_url: z.string().url(),
+  latest: updateManifestSchema.nullable(),
+});
+
+const REPOSITORY_URL = "https://github.com/shuting52/jizhangben.git";
+
+function decodeHtmlAttribute(value: string) {
+  return value.replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/&quot;/g, '"');
+}
+
+function findManifestLink(html: string, baseUrl: string) {
+  const matches = html.matchAll(/href=["']([^"']*version\.json[^"']*)["']/gi);
+  for (const match of matches) {
+    const href = match[1];
+    if (!href) continue;
+    try {
+      return new URL(decodeHtmlAttribute(href), baseUrl).toString();
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function findRawManifestLink(html: string, baseUrl: string) {
+  const patterns = [
+    /"rawBlobUrl":"([^"]+)"/i,
+    /"rawLinesUrl":"([^"]+)"/i,
+    /href=["']([^"']+)["'][^>]*>\s*Raw\s*</i,
+  ];
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    const href = match?.[1];
+    if (!href) continue;
+    try {
+      const decoded = decodeHtmlAttribute(href.replace(/\\u002F/g, "/"));
+      return new URL(decoded, baseUrl).toString();
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
 export const Actions = {
+  checkForUpdate: defineAction({
+    request: z.object({ current_version_code: z.number().int().positive() }),
+    response: updateCheckResponseSchema,
+    async handler(_ctx, args): Promise<z.infer<typeof updateCheckResponseSchema>> {
+      const checkedAt = new Date().toISOString();
+      try {
+        const repositoryResponse = await fetch(REPOSITORY_URL, {
+          headers: { Accept: "text/html", "User-Agent": "Bookkeeping-App-Update-Checker" },
+          redirect: "follow",
+        });
+        if (!repositoryResponse.ok) {
+          return { status: "check_failed", message: "暂时无法连接版本仓库，请稍后再试。", checked_at: checkedAt, source_url: REPOSITORY_URL, latest: null };
+        }
+        const repositoryHtml = await repositoryResponse.text();
+        const manifestPageUrl = findManifestLink(repositoryHtml, repositoryResponse.url || REPOSITORY_URL);
+        if (!manifestPageUrl) {
+          return { status: "manifest_missing", message: "更新通道已接入，等待仓库发布 version.json。", checked_at: checkedAt, source_url: REPOSITORY_URL, latest: null };
+        }
+        const manifestPageResponse = await fetch(manifestPageUrl, {
+          headers: { Accept: "text/html", "User-Agent": "Bookkeeping-App-Update-Checker" },
+          redirect: "follow",
+        });
+        if (!manifestPageResponse.ok) {
+          return { status: "check_failed", message: "版本信息暂时读取失败，请稍后再试。", checked_at: checkedAt, source_url: REPOSITORY_URL, latest: null };
+        }
+        const manifestPageHtml = await manifestPageResponse.text();
+        const rawManifestUrl = findRawManifestLink(manifestPageHtml, manifestPageResponse.url || manifestPageUrl);
+        if (!rawManifestUrl) {
+          return { status: "check_failed", message: "version.json 已找到，但内容暂时无法读取。", checked_at: checkedAt, source_url: REPOSITORY_URL, latest: null };
+        }
+        const manifestResponse = await fetch(rawManifestUrl, {
+          headers: { Accept: "application/json", "User-Agent": "Bookkeeping-App-Update-Checker" },
+          redirect: "follow",
+        });
+        if (!manifestResponse.ok) {
+          return { status: "check_failed", message: "版本信息暂时读取失败，请稍后再试。", checked_at: checkedAt, source_url: REPOSITORY_URL, latest: null };
+        }
+        const latest = updateManifestSchema.parse(await manifestResponse.json());
+        if (latest.version_code <= args.current_version_code) {
+          return { status: "up_to_date", message: `当前已是最新版（${latest.version}）。`, checked_at: checkedAt, source_url: REPOSITORY_URL, latest };
+        }
+        if (!latest.apk_url) {
+          return { status: "package_pending", message: `发现 ${latest.version}，安装包还在准备中。`, checked_at: checkedAt, source_url: REPOSITORY_URL, latest };
+        }
+        return { status: "update_available", message: `发现新版本 ${latest.version}。`, checked_at: checkedAt, source_url: REPOSITORY_URL, latest };
+      } catch {
+        return { status: "check_failed", message: "检查更新失败，请确认网络后重试。", checked_at: checkedAt, source_url: REPOSITORY_URL, latest: null };
+      }
+    },
+  }),
+
   listTransactions: defineAction({
     request: z.object({ limit: z.number().int().positive().max(300).default(100) }),
     response: z.object({ transactions: z.array(transactionSchema) }),
@@ -207,6 +339,9 @@ export const Actions = {
           break_minutes: row.breakMinutes,
           compensation_type: row.compensationType,
           status: row.status,
+          overtime_type: row.overtimeType,
+          allowance_cents: row.allowanceCents,
+          deduction_cents: row.deductionCents,
           created_at: row.createdAt.toISOString(),
         })),
       };
@@ -235,6 +370,9 @@ export const Actions = {
           breakMinutes: args.break_minutes,
           compensationType: args.compensation_type,
           status: args.status,
+          overtimeType: args.overtime_type,
+          allowanceCents: args.allowance_cents,
+          deductionCents: args.deduction_cents,
         })
         .returning({ id: schema.overtimeEntries.id });
       const row = inserted[0];
@@ -263,6 +401,9 @@ export const Actions = {
         breakMinutes: args.break_minutes,
         compensationType: args.compensation_type,
         status: args.status,
+        overtimeType: args.overtime_type,
+        allowanceCents: args.allowance_cents,
+        deductionCents: args.deduction_cents,
       }).where(eq(schema.overtimeEntries.id, args.id));
       ctx.invalidateQueries();
       return { id: args.id, pay_cents: payCents };
@@ -274,6 +415,149 @@ export const Actions = {
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
       await ctx.db<typeof schema>().update(schema.overtimeEntries).set({ status: args.status }).where(eq(schema.overtimeEntries.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  getOvertimeSettings: defineAction({
+    request: z.object({}),
+    response: overtimeSettingsSchema,
+    async handler(ctx): Promise<z.infer<typeof overtimeSettingsSchema>> {
+      const row = await ctx.db<typeof schema>().select().from(schema.overtimeSettings).where(eq(schema.overtimeSettings.id, 1)).limit(1);
+      const settings = row[0];
+      if (!settings) {
+        return { base_salary_cents: 0, standard_days_hundredths: 2175, standard_hours_hundredths: 800, calculated_hourly_rate_cents: 0, updated_at: null };
+      }
+      const days = settings.standardDaysHundredths / 100;
+      const hours = settings.standardHoursHundredths / 100;
+      const hourly = days > 0 && hours > 0 ? Math.round(settings.baseSalaryCents / days / hours) : 0;
+      return {
+        base_salary_cents: settings.baseSalaryCents,
+        standard_days_hundredths: settings.standardDaysHundredths,
+        standard_hours_hundredths: settings.standardHoursHundredths,
+        calculated_hourly_rate_cents: hourly,
+        updated_at: settings.updatedAt.toISOString(),
+      };
+    },
+  }),
+
+  setOvertimeSettings: defineAction({
+    request: z.object({
+      base_salary_cents: z.number().int().min(0).max(999999999),
+      standard_days_hundredths: z.number().int().min(100).max(3100),
+      standard_hours_hundredths: z.number().int().min(100).max(2400),
+    }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      await ctx.db<typeof schema>().insert(schema.overtimeSettings).values({
+        id: 1,
+        baseSalaryCents: args.base_salary_cents,
+        standardDaysHundredths: args.standard_days_hundredths,
+        standardHoursHundredths: args.standard_hours_hundredths,
+        updatedAt: new Date(),
+      }).onConflictDoUpdate({
+        target: schema.overtimeSettings.id,
+        set: {
+          baseSalaryCents: args.base_salary_cents,
+          standardDaysHundredths: args.standard_days_hundredths,
+          standardHoursHundredths: args.standard_hours_hundredths,
+          updatedAt: new Date(),
+        },
+      });
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  getActiveOvertimeShift: defineAction({
+    request: z.object({}),
+    response: z.object({ active: activeShiftSchema.nullable() }),
+    async handler(ctx): Promise<{ active: z.infer<typeof activeShiftSchema> | null }> {
+      const rows = await ctx.db<typeof schema>().select().from(schema.activeOvertimeShift).where(eq(schema.activeOvertimeShift.id, 1)).limit(1);
+      const row = rows[0];
+      return { active: row ? {
+        work_date: row.workDate,
+        start_time: row.startTime,
+        started_at: row.startedAt.toISOString(),
+        note: row.note,
+        overtime_type: row.overtimeType,
+        compensation_type: row.compensationType,
+      } : null };
+    },
+  }),
+
+  startOvertimeShift: defineAction({
+    request: z.object({
+      work_date: dateSchema,
+      start_time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),
+      started_at: z.string().datetime(),
+      note: z.string().trim().max(80),
+      overtime_type: overtimeTypeSchema,
+      compensation_type: compensationTypeSchema,
+    }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      await ctx.db<typeof schema>().insert(schema.activeOvertimeShift).values({
+        id: 1,
+        workDate: args.work_date,
+        startTime: args.start_time,
+        startedAt: new Date(args.started_at),
+        note: args.note,
+        overtimeType: args.overtime_type,
+        compensationType: args.compensation_type,
+      }).onConflictDoNothing();
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  finishOvertimeShift: defineAction({
+    request: z.object({ ended_at: z.string().datetime(), end_time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/) }),
+    response: z.object({ id: z.number(), minutes: z.number(), pay_cents: z.number() }),
+    async handler(ctx, args): Promise<{ id: number; minutes: number; pay_cents: number }> {
+      const db = ctx.db<typeof schema>();
+      const shifts = await db.select().from(schema.activeOvertimeShift).where(eq(schema.activeOvertimeShift.id, 1)).limit(1);
+      const shift = shifts[0];
+      if (!shift) throw new Error("没有进行中的加班打卡");
+      const endedAt = new Date(args.ended_at);
+      const minutes = Math.max(1, Math.min(1440, Math.round((endedAt.getTime() - shift.startedAt.getTime()) / 60000)));
+      const settingsRows = await db.select().from(schema.overtimeSettings).where(eq(schema.overtimeSettings.id, 1)).limit(1);
+      const settings = settingsRows[0];
+      const days = (settings?.standardDaysHundredths ?? 2175) / 100;
+      const hours = (settings?.standardHoursHundredths ?? 800) / 100;
+      const hourlyRateCents = settings && days > 0 && hours > 0 ? Math.round(settings.baseSalaryCents / days / hours) : 0;
+      const multiplierHundredths = shift.overtimeType === "holiday" ? 300 : shift.overtimeType === "rest_day" ? 200 : 150;
+      const payCents = shift.compensationType === "pay" ? Math.round((minutes / 60) * hourlyRateCents * (multiplierHundredths / 100)) : 0;
+      const inserted = await db.insert(schema.overtimeEntries).values({
+        workDate: shift.workDate,
+        minutes,
+        hourlyRateCents,
+        multiplierHundredths,
+        payCents,
+        note: shift.note || "加班打卡",
+        startTime: shift.startTime,
+        endTime: args.end_time,
+        breakMinutes: 0,
+        compensationType: shift.compensationType,
+        status: "pending",
+        overtimeType: shift.overtimeType,
+        allowanceCents: 0,
+        deductionCents: 0,
+      }).returning({ id: schema.overtimeEntries.id });
+      const row = inserted[0];
+      if (!row) throw new Error("保存失败，请稍后再试");
+      await db.delete(schema.activeOvertimeShift).where(eq(schema.activeOvertimeShift.id, 1));
+      ctx.invalidateQueries();
+      return { id: row.id, minutes, pay_cents: payCents };
+    },
+  }),
+
+  cancelOvertimeShift: defineAction({
+    request: z.object({}),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx): Promise<{ ok: true }> {
+      await ctx.db<typeof schema>().delete(schema.activeOvertimeShift).where(eq(schema.activeOvertimeShift.id, 1));
       ctx.invalidateQueries();
       return { ok: true };
     },

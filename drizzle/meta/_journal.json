@@ -29,6 +29,13 @@
       "when": 1791353763358,
       "tag": "0004_improve_overtime_tracking",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1791355699423,
+      "tag": "0005_add_overtime_payroll_tools",
+      "breakpoints": true
     }
   ]
 }

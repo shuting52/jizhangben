@@ -1,7 +1,7 @@
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type ApiResponse } from "./api";
 import backgroundImage from "./assets/landscape-ribbon-background.jpg";
 
@@ -12,7 +12,12 @@ type OvertimeEntry = ApiResponse<typeof api, "listOvertimeEntries">["entries"][n
 type Tab = "ledger" | "overtime";
 type CompensationType = "pay" | "time_off";
 type OvertimeStatus = "pending" | "settled";
+type OvertimeType = "workday" | "rest_day" | "holiday";
 type DurationMode = "clock" | "manual";
+type UpdateCheck = ApiResponse<typeof api, "checkForUpdate">;
+
+const CURRENT_VERSION = "1.0.0";
+const CURRENT_VERSION_CODE = 1;
 
 type SpeechEventLike = { results: ArrayLike<{ 0: { transcript: string }; isFinal: boolean }> };
 type SpeechErrorLike = { error: string };
@@ -88,6 +93,28 @@ function formatMinutes(minutes: number) {
   return rest === 0 ? `${hours}小时` : `${hours}小时${rest}分`;
 }
 
+function overtimeTypeInfo(type: OvertimeType) {
+  if (type === "holiday") return { label: "法定节假日", multiplier: "3", short: "法" };
+  if (type === "rest_day") return { label: "休息日", multiplier: "2", short: "休" };
+  return { label: "工作日", multiplier: "1.5", short: "工" };
+}
+
+function daysInMonth(month: string) {
+  const [yearValue = "1970", monthValue = "1"] = month.split("-");
+  return new Date(Number(yearValue), Number(monthValue), 0).getDate();
+}
+
+function monthCalendar(month: string) {
+  const [yearValue = "1970", monthValue = "1"] = month.split("-");
+  const year = Number(yearValue);
+  const monthIndex = Number(monthValue) - 1;
+  const mondayOffset = (new Date(year, monthIndex, 1).getDay() + 6) % 7;
+  return [
+    ...Array.from({ length: mondayOffset }, () => null),
+    ...Array.from({ length: daysInMonth(month) }, (_, index) => `${month}-${String(index + 1).padStart(2, "0")}`),
+  ];
+}
+
 function minutesBetween(start: string, end: string, breakMinutes: number) {
   const [startHour = 0, startMinute = 0] = start.split(":").map(Number);
   const [endHour = 0, endMinute = 0] = end.split(":").map(Number);
@@ -102,6 +129,19 @@ function MicIcon() {
 
 function PlusIcon() {
   return <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14"/></svg>;
+}
+
+function UpdateIcon() {
+  return <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 11a8 8 0 1 0-2.34 5.66"/><path d="M20 4v7h-7"/><path d="M12 8v7m0 0 3-3m-3 3-3-3"/></svg>;
+}
+
+function updateStatusCopy(result: UpdateCheck | undefined) {
+  if (!result) return { eyebrow: "版本检查", title: "检查新版本", tone: "neutral" as const };
+  if (result.status === "update_available") return { eyebrow: "有新版本", title: result.latest?.title ?? "发现新版本", tone: "update" as const };
+  if (result.status === "up_to_date") return { eyebrow: "版本检查", title: "已是最新版", tone: "success" as const };
+  if (result.status === "package_pending") return { eyebrow: "版本检查", title: "安装包准备中", tone: "neutral" as const };
+  if (result.status === "manifest_missing") return { eyebrow: "更新通道", title: "更新功能已接入", tone: "neutral" as const };
+  return { eyebrow: "版本检查", title: "暂时无法检查", tone: "error" as const };
 }
 
 export function App() {
@@ -132,10 +172,27 @@ export function App() {
   const [multiplier, setMultiplier] = useState("1.5");
   const [compensationType, setCompensationType] = useState<CompensationType>("pay");
   const [overtimeStatus, setOvertimeStatus] = useState<OvertimeStatus>("pending");
+  const [overtimeType, setOvertimeType] = useState<OvertimeType>("workday");
+  const [allowanceAmount, setAllowanceAmount] = useState("");
+  const [deductionAmount, setDeductionAmount] = useState("");
   const [workNote, setWorkNote] = useState("");
   const [deleteOvertimeId, setDeleteOvertimeId] = useState<number | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [baseSalary, setBaseSalary] = useState("");
+  const [standardDays, setStandardDays] = useState("21.75");
+  const [standardHours, setStandardHours] = useState("8");
+  const [punchType, setPunchType] = useState<OvertimeType>(() => [0, 6].includes(new Date().getDay()) ? "rest_day" : "workday");
+  const [punchNote, setPunchNote] = useState("");
+  const [clockNow, setClockNow] = useState(Date.now());
+  const [updateOpen, setUpdateOpen] = useState(false);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
 
+  const updateCheck = useQuery({
+    queryKey: ["app-update", CURRENT_VERSION_CODE],
+    queryFn: () => api.checkForUpdate({ current_version_code: CURRENT_VERSION_CODE }),
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  });
   const records = useQuery({
     queryKey: ["transactions"],
     queryFn: () => api.listTransactions({ limit: 300 }),
@@ -148,6 +205,27 @@ export function App() {
     queryKey: ["overtime"],
     queryFn: () => api.listOvertimeEntries({ limit: 300 }),
   });
+  const overtimeSettings = useQuery({
+    queryKey: ["overtime-settings"],
+    queryFn: () => api.getOvertimeSettings({}),
+  });
+  const activeShift = useQuery({
+    queryKey: ["active-overtime-shift"],
+    queryFn: () => api.getActiveOvertimeShift({}),
+    refetchInterval: 60_000,
+  });
+
+  useEffect(() => {
+    if (!activeShift.data?.active) return;
+    const timer = window.setInterval(() => setClockNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, [activeShift.data?.active]);
+
+  useEffect(() => {
+    if (updateCheck.data?.status !== "update_available") return;
+    const dismissedVersion = window.sessionStorage.getItem("dismissed-update-version");
+    if (dismissedVersion !== updateCheck.data.latest?.version) setUpdateOpen(true);
+  }, [updateCheck.data]);
 
   const parseVoice = useMutation({
     mutationFn: (text: string) => api.parseVoiceEntry({ transcript: text }),
@@ -226,6 +304,58 @@ export function App() {
     },
   });
 
+  const saveOvertimeSettings = useMutation({
+    mutationFn: () => api.setOvertimeSettings({
+      base_salary_cents: Math.round(Number(baseSalary || 0) * 100),
+      standard_days_hundredths: Math.round(Number(standardDays) * 100),
+      standard_hours_hundredths: Math.round(Number(standardHours) * 100),
+    }),
+    onSuccess: async () => {
+      setSettingsOpen(false);
+      await queryClient.invalidateQueries({ queryKey: ["overtime-settings"] });
+    },
+  });
+
+  const startShift = useMutation({
+    mutationFn: () => {
+      const now = new Date();
+      return api.startOvertimeShift({
+        work_date: localDateKey(now),
+        start_time: `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`,
+        started_at: now.toISOString(),
+        note: punchNote.trim(),
+        overtime_type: punchType,
+        compensation_type: "pay",
+      });
+    },
+    onSuccess: async () => {
+      setClockNow(Date.now());
+      await queryClient.invalidateQueries({ queryKey: ["active-overtime-shift"] });
+    },
+  });
+
+  const finishShift = useMutation({
+    mutationFn: () => {
+      const now = new Date();
+      return api.finishOvertimeShift({
+        ended_at: now.toISOString(),
+        end_time: `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`,
+      });
+    },
+    onSuccess: async () => {
+      setPunchNote("");
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["active-overtime-shift"] }),
+        queryClient.invalidateQueries({ queryKey: ["overtime"] }),
+      ]);
+    },
+  });
+
+  const cancelShift = useMutation({
+    mutationFn: () => api.cancelOvertimeShift({}),
+    onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["active-overtime-shift"] }),
+  });
+
   const monthRows = useMemo(() => (records.data?.transactions ?? []).filter((row) => localMonthKey(new Date(row.occurred_at)) === selectedMonth), [records.data, selectedMonth]);
   const summary = useMemo(() => monthRows.reduce((acc, row) => {
     if (row.kind === "expense") acc.expense += row.amount_cents;
@@ -249,9 +379,19 @@ export function App() {
     minutes: acc.minutes + entry.minutes,
     pendingPay: acc.pendingPay + (entry.compensation_type === "pay" && entry.status === "pending" ? entry.pay_cents : 0),
     settledPay: acc.settledPay + (entry.compensation_type === "pay" && entry.status === "settled" ? entry.pay_cents : 0),
+    totalPay: acc.totalPay + (entry.compensation_type === "pay" ? entry.pay_cents : 0),
+    allowances: acc.allowances + entry.allowance_cents,
+    deductions: acc.deductions + entry.deduction_cents,
     pendingTimeOff: acc.pendingTimeOff + (entry.compensation_type === "time_off" && entry.status === "pending" ? entry.minutes : 0),
     pendingCount: acc.pendingCount + (entry.status === "pending" ? 1 : 0),
-  }), { minutes: 0, pendingPay: 0, settledPay: 0, pendingTimeOff: 0, pendingCount: 0 }), [monthOvertime]);
+  }), { minutes: 0, pendingPay: 0, settledPay: 0, totalPay: 0, allowances: 0, deductions: 0, pendingTimeOff: 0, pendingCount: 0 }), [monthOvertime]);
+  const baseSalaryCents = overtimeSettings.data?.base_salary_cents ?? 0;
+  const estimatedPayroll = baseSalaryCents + overtimeSummary.totalPay + overtimeSummary.allowances - overtimeSummary.deductions;
+  const activeElapsedMinutes = activeShift.data?.active
+    ? Math.max(0, Math.round((clockNow - new Date(activeShift.data.active.started_at).getTime()) / 60000))
+    : 0;
+  const calendarDays = useMemo(() => monthCalendar(selectedMonth), [selectedMonth]);
+  const overtimeByDay = useMemo(() => new Map(monthOvertime.map((entry) => [entry.work_date, (monthOvertime.filter((item) => item.work_date === entry.work_date).reduce((sum, item) => sum + item.minutes, 0))])), [monthOvertime]);
 
   function startListening() {
     const Ctor = window.SpeechRecognition ?? window.webkitSpeechRecognition;
@@ -308,6 +448,10 @@ export function App() {
     setMultiplier(presetMultiplier);
     setCompensationType("pay");
     setOvertimeStatus("pending");
+    setOvertimeType(presetMultiplier === "2" ? "rest_day" : presetMultiplier === "3" ? "holiday" : "workday");
+    setAllowanceAmount("");
+    setDeductionAmount("");
+    setHourlyRate(overtimeSettings.data?.calculated_hourly_rate_cents ? String(overtimeSettings.data.calculated_hourly_rate_cents / 100) : "");
     setOvertimeOpen(true);
   }
 
@@ -323,8 +467,18 @@ export function App() {
     setMultiplier(String(entry.multiplier_hundredths / 100));
     setCompensationType(entry.compensation_type);
     setOvertimeStatus(entry.status);
+    setOvertimeType(entry.overtime_type);
+    setAllowanceAmount(entry.allowance_cents === 0 ? "" : String(entry.allowance_cents / 100));
+    setDeductionAmount(entry.deduction_cents === 0 ? "" : String(entry.deduction_cents / 100));
     setWorkNote(entry.note);
     setOvertimeOpen(true);
+  }
+
+  function openOvertimeSettings() {
+    setBaseSalary(overtimeSettings.data?.base_salary_cents ? String(overtimeSettings.data.base_salary_cents / 100) : "");
+    setStandardDays(String((overtimeSettings.data?.standard_days_hundredths ?? 2175) / 100));
+    setStandardHours(String((overtimeSettings.data?.standard_hours_hundredths ?? 800) / 100));
+    setSettingsOpen(true);
   }
 
   const calculatedMinutes = durationMode === "clock"
@@ -343,13 +497,30 @@ export function App() {
       break_minutes: durationMode === "clock" ? Math.round(Number(breakMinutes) || 0) : 0,
       compensation_type: compensationType,
       status: overtimeStatus,
+      overtime_type: overtimeType,
+      allowance_cents: Math.round(Number(allowanceAmount || 0) * 100),
+      deduction_cents: Math.round(Number(deductionAmount || 0) * 100),
     };
+  }
+
+  async function openUpdateChecker() {
+    setUpdateOpen(true);
+    await updateCheck.refetch();
+  }
+
+  function closeUpdateChecker() {
+    if (updateCheck.data?.status === "update_available" && updateCheck.data.latest?.version) {
+      window.sessionStorage.setItem("dismissed-update-version", updateCheck.data.latest.version);
+    }
+    setUpdateOpen(false);
   }
 
   const amountValid = Number(amount) > 0 && Number.isFinite(Number(amount));
   const budgetValid = Number(budgetAmount) > 0 && Number.isFinite(Number(budgetAmount));
-  const overtimeValid = calculatedMinutes > 0 && calculatedMinutes <= 1440 && Number(hourlyRate || 0) >= 0 && Number(multiplier) >= 1 && Number(multiplier) <= 3;
+  const overtimeValid = calculatedMinutes > 0 && calculatedMinutes <= 1440 && Number(hourlyRate || 0) >= 0 && Number(multiplier) >= 1 && Number(multiplier) <= 3 && Number(allowanceAmount || 0) >= 0 && Number(deductionAmount || 0) >= 0;
+  const settingsValid = Number(baseSalary || 0) >= 0 && Number(standardDays) > 0 && Number(standardHours) > 0;
   const projectedPay = overtimeValid && compensationType === "pay" ? Math.round((calculatedMinutes / 60) * Number(hourlyRate || 0) * Number(multiplier) * 100) : 0;
+  const updateCopy = updateStatusCopy(updateCheck.data);
 
   return (
     <div className="app-background min-h-screen" style={{ backgroundImage: `url(${backgroundImage})` }}>
@@ -359,6 +530,7 @@ export function App() {
           <div className="glass-strip flex items-center justify-between p-1.5" aria-label="功能切换">
             <button type="button" onClick={() => setTab("ledger")} className={`flex-1 rounded-[13px] py-2.5 text-sm font-bold transition ${tab === "ledger" ? "bg-[var(--surface-strong)] text-[var(--text)] shadow-sm" : "text-[var(--dim)]"}`}>月度管账</button>
             <button type="button" onClick={() => setTab("overtime")} className={`flex-1 rounded-[13px] py-2.5 text-sm font-bold transition ${tab === "overtime" ? "bg-[var(--surface-strong)] text-[var(--text)] shadow-sm" : "text-[var(--dim)]"}`}>加班记录</button>
+            <button type="button" onClick={() => void openUpdateChecker()} aria-label="检查应用更新" className="ml-1 flex min-h-10 shrink-0 items-center gap-1 rounded-[12px] px-2.5 text-xs font-bold text-[var(--dim)] transition active:bg-[var(--soft)]"><UpdateIcon /><span>更新</span>{updateCheck.data?.status === "update_available" && <span className="update-dot" aria-hidden="true" />}</button>
           </div>
           <div className="mt-3 flex items-center justify-center gap-4 text-[var(--text-on-image)]">
             <button type="button" aria-label="查看上个月" onClick={() => setSelectedMonth((value) => shiftMonth(value, -1))} className="glass-control h-9 w-9 rounded-full text-lg">‹</button>
@@ -460,7 +632,7 @@ export function App() {
             <section className="glass-panel mt-3 overflow-hidden" aria-labelledby="overtime-summary-heading">
               <div className="flex items-start justify-between gap-3 px-5 pt-5">
                 <div><p id="overtime-summary-heading" className="text-sm text-[var(--dim)]">本月累计加班</p><p className="amount-font mt-1 text-4xl font-bold">{formatMinutes(overtimeSummary.minutes)}</p></div>
-                <button type="button" onClick={() => openOvertimeForm()} className="flex items-center gap-1 rounded-[12px] bg-[var(--accent)] px-3 py-2 text-xs font-bold text-[var(--accent-ink)]"><PlusIcon />记加班</button>
+                <button type="button" onClick={() => openOvertimeForm()} className="flex items-center gap-1 rounded-[12px] bg-[var(--accent)] px-3 py-2 text-xs font-bold text-[var(--accent-ink)]"><PlusIcon />手动补记</button>
               </div>
               <div className="mt-5 grid grid-cols-3 border-t border-[var(--border)]">
                 <div className="border-r border-[var(--border)] px-3 py-4"><p className="text-xs text-[var(--dim)]">待结算</p><p className="amount-font mt-1 font-bold text-[var(--accent)]">{yuan(overtimeSummary.pendingPay)}</p></div>
@@ -469,14 +641,49 @@ export function App() {
               </div>
             </section>
 
+            <section className="glass-panel mt-4 px-5 py-5" aria-labelledby="punch-heading">
+              <div className="flex items-start justify-between gap-3"><div><h2 id="punch-heading" className="text-lg font-bold">打卡记加班</h2><p className="mt-1 text-sm text-[var(--dim)]">开始时打卡，结束时自动生成工时和加班费。</p></div><span className={`status-chip ${activeShift.data?.active ? "status-pending" : "status-done"}`}>{activeShift.data?.active ? "进行中" : "未打卡"}</span></div>
+              {activeShift.data?.active ? (
+                <div className="mt-4 rounded-[16px] bg-[var(--soft)] px-4 py-4">
+                  <p className="text-xs text-[var(--dim)]">{activeShift.data.active.start_time} 开始 · {overtimeTypeInfo(activeShift.data.active.overtime_type).label}</p>
+                  <p className="amount-font mt-1 text-3xl font-bold">{formatMinutes(activeElapsedMinutes)}</p>
+                  <p className="mt-1 text-sm text-[var(--dim)]">{activeShift.data.active.note || "加班打卡"}</p>
+                  <div className="mt-4 grid grid-cols-[1fr_auto] gap-2"><button type="button" disabled={finishShift.isPending} onClick={() => finishShift.mutate()} className="rounded-[13px] bg-[var(--accent)] px-4 py-3 font-bold text-[var(--accent-ink)]">{finishShift.isPending ? "正在保存…" : "结束打卡"}</button><button type="button" disabled={cancelShift.isPending} onClick={() => cancelShift.mutate()} className="rounded-[13px] px-4 py-3 text-sm font-semibold text-[var(--danger)]">取消</button></div>
+                </div>
+              ) : (
+                <>
+                  <div className="mt-4 grid grid-cols-3 gap-2" aria-label="打卡加班类型">{(["workday", "rest_day", "holiday"] as OvertimeType[]).map((type) => <button type="button" key={type} onClick={() => setPunchType(type)} className={`rounded-[12px] px-2 py-2.5 text-xs font-bold ${punchType === type ? "bg-[var(--surface-strong)] shadow-sm" : "bg-[var(--soft)] text-[var(--dim)]"}`}>{overtimeTypeInfo(type).label}<span className="mt-0.5 block text-[10px] font-medium">{overtimeTypeInfo(type).multiplier} 倍</span></button>)}</div>
+                  <input aria-label="打卡事项" value={punchNote} onChange={(event) => setPunchNote(event.target.value)} placeholder="加班事项（可选）" className="form-control mt-3" />
+                  <button type="button" disabled={startShift.isPending} onClick={() => startShift.mutate()} className="primary-wide">{startShift.isPending ? "正在打卡…" : "开始加班打卡"}</button>
+                </>
+              )}
+              {(startShift.error || finishShift.error) && <p role="alert" className="mt-3 text-sm text-[var(--danger)]">打卡失败，请稍后重试。</p>}
+            </section>
+
+            <section className="glass-panel mt-4 overflow-hidden" aria-labelledby="payroll-heading">
+              <div className="flex items-start justify-between gap-3 px-5 pt-5"><div><p className="text-xs text-[var(--dim)]">{monthLabel(selectedMonth)}预估工资</p><h2 id="payroll-heading" className="amount-font mt-1 text-3xl font-bold">{yuan(estimatedPayroll)}</h2></div><button type="button" onClick={openOvertimeSettings} className="rounded-[11px] bg-[var(--soft)] px-3 py-2 text-xs font-bold">工资设置</button></div>
+              <div className="mt-4 grid grid-cols-2 border-t border-[var(--border)] text-sm">
+                <div className="border-b border-r border-[var(--border)] px-5 py-3"><p className="text-xs text-[var(--dim)]">月基本工资</p><p className="amount-font mt-1 font-bold">{yuan(baseSalaryCents)}</p></div>
+                <div className="border-b border-[var(--border)] px-5 py-3"><p className="text-xs text-[var(--dim)]">加班费</p><p className="amount-font mt-1 font-bold text-[var(--accent)]">+{yuan(overtimeSummary.totalPay)}</p></div>
+                <div className="border-r border-[var(--border)] px-5 py-3"><p className="text-xs text-[var(--dim)]">补贴</p><p className="amount-font mt-1 font-bold">+{yuan(overtimeSummary.allowances)}</p></div>
+                <div className="px-5 py-3"><p className="text-xs text-[var(--dim)]">扣款</p><p className="amount-font mt-1 font-bold text-[var(--danger)]">−{yuan(overtimeSummary.deductions)}</p></div>
+              </div>
+            </section>
+
+            <section className="glass-panel mt-4 px-4 py-5" aria-labelledby="calendar-heading">
+              <div className="flex items-center justify-between"><h2 id="calendar-heading" className="text-lg font-bold">加班日历</h2><span className="text-xs text-[var(--dim)]">共 {monthOvertime.length} 条</span></div>
+              <div className="mt-4 grid grid-cols-7 text-center text-[11px] font-semibold text-[var(--dim)]">{["一", "二", "三", "四", "五", "六", "日"].map((day) => <span key={day}>{day}</span>)}</div>
+              <div className="mt-2 grid grid-cols-7 gap-1">{calendarDays.map((date, index) => date ? <button type="button" key={date} onClick={() => { openOvertimeForm(); setWorkDate(date); }} aria-label={`${shortDate(date)}${overtimeByDay.get(date) ? `，加班${formatMinutes(overtimeByDay.get(date) ?? 0)}` : ""}`} className={`calendar-day ${date === localDateKey() ? "calendar-today" : ""} ${overtimeByDay.has(date) ? "calendar-worked" : ""}`}><span>{Number(date.slice(-2))}</span>{overtimeByDay.has(date) && <small>{Math.round((overtimeByDay.get(date) ?? 0) / 60 * 10) / 10}h</small>}</button> : <span key={`blank-${index}`} className="calendar-day calendar-blank" />)}</div>
+            </section>
+
             <section className="glass-panel mt-4 px-5 py-5">
               <h2 className="text-lg font-bold">老师常用</h2>
-              <p className="mt-1 text-sm leading-6 text-[var(--dim)]">选择事项后补充起止时间，系统自动扣除休息并计算工时；也可改成直接填时长。</p>
+              <p className="mt-1 text-sm leading-6 text-[var(--dim)]">点选后继续补充时间；工作日、休息日和法定节假日按 1.5 / 2 / 3 倍自动计算。</p>
               <div className="mt-4 grid grid-cols-2 gap-2 text-sm font-semibold sm:grid-cols-4">
-                <button type="button" onClick={() => openOvertimeForm("晚自习", "1")} className="glass-control rounded-[12px] border border-[var(--border)] px-2 py-3">晚自习</button>
-                <button type="button" onClick={() => openOvertimeForm("周末值班", "1.5")} className="glass-control rounded-[12px] border border-[var(--border)] px-2 py-3">周末值班</button>
-                <button type="button" onClick={() => openOvertimeForm("临时代课", "1")} className="glass-control rounded-[12px] border border-[var(--border)] px-2 py-3">临时代课</button>
-                <button type="button" onClick={() => openOvertimeForm("监考阅卷", "1")} className="glass-control rounded-[12px] border border-[var(--border)] px-2 py-3">监考阅卷</button>
+                <button type="button" onClick={() => openOvertimeForm("晚自习", "1.5")} className="glass-control rounded-[12px] border border-[var(--border)] px-2 py-3">晚自习</button>
+                <button type="button" onClick={() => openOvertimeForm("周末值班", "2")} className="glass-control rounded-[12px] border border-[var(--border)] px-2 py-3">周末值班</button>
+                <button type="button" onClick={() => openOvertimeForm("临时代课", "1.5")} className="glass-control rounded-[12px] border border-[var(--border)] px-2 py-3">临时代课</button>
+                <button type="button" onClick={() => openOvertimeForm("监考阅卷", "1.5")} className="glass-control rounded-[12px] border border-[var(--border)] px-2 py-3">监考阅卷</button>
               </div>
             </section>
 
@@ -494,8 +701,9 @@ export function App() {
                       <button type="button" onClick={() => editOvertime(entry)} aria-label={`编辑${entry.note || "加班"}记录`} className="min-w-0 flex-1 text-left">
                         <div className="flex flex-wrap items-center gap-2"><p className="truncate font-semibold">{entry.note || "加班"}</p><span className={`status-chip ${entry.status === "settled" ? "status-done" : "status-pending"}`}>{entry.status === "settled" ? "已完成" : "待处理"}</span></div>
                         <p className="mt-1 text-xs text-[var(--dim)]">{entry.start_time && entry.end_time ? `${entry.start_time}–${entry.end_time} · ` : ""}{formatMinutes(entry.minutes)}{entry.break_minutes > 0 ? ` · 休息${entry.break_minutes}分` : ""}</p>
+                        <p className="mt-1 text-[11px] text-[var(--dim)]">{overtimeTypeInfo(entry.overtime_type).label}{entry.allowance_cents > 0 ? ` · 补贴${yuan(entry.allowance_cents)}` : ""}{entry.deduction_cents > 0 ? ` · 扣款${yuan(entry.deduction_cents)}` : ""}</p>
                       </button>
-                      <div className="shrink-0 text-right"><p className="amount-font font-bold">{entry.compensation_type === "pay" ? yuan(entry.pay_cents) : "调休"}</p><p className="mt-1 text-[11px] text-[var(--dim)]">{entry.compensation_type === "pay" ? `${entry.multiplier_hundredths / 100} 倍` : formatMinutes(entry.minutes)}</p></div>
+                      <div className="shrink-0 text-right"><p className="amount-font font-bold">{entry.compensation_type === "pay" ? yuan(entry.pay_cents + entry.allowance_cents - entry.deduction_cents) : "调休"}</p><p className="mt-1 text-[11px] text-[var(--dim)]">{entry.compensation_type === "pay" ? `${entry.multiplier_hundredths / 100} 倍` : formatMinutes(entry.minutes)}</p></div>
                     </div>
                     <div className="mt-3 flex items-center justify-end gap-2 border-t border-[var(--border)] pt-2">
                       <button type="button" disabled={changeOvertimeStatus.isPending} onClick={() => changeOvertimeStatus.mutate({ id: entry.id, status: entry.status === "pending" ? "settled" : "pending" })} className="rounded-lg bg-[var(--soft)] px-3 py-2 text-xs font-semibold">{entry.status === "pending" ? (entry.compensation_type === "pay" ? "标记已结算" : "标记已调休") : "改回待处理"}</button>
@@ -509,6 +717,45 @@ export function App() {
           </>
         )}
       </main>
+
+      {updateOpen && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="应用更新">
+          <div className="glass-dialog modal-sheet update-sheet">
+            <div className="modal-handle" />
+            <div className="flex items-start justify-between gap-4">
+              <div className={`update-symbol update-symbol-${updateCopy.tone}`} aria-hidden="true"><UpdateIcon /></div>
+              <button type="button" aria-label="关闭更新窗口" onClick={closeUpdateChecker} className="h-10 w-10 shrink-0 rounded-full bg-[var(--soft)] text-xl">×</button>
+            </div>
+            {updateCheck.isFetching ? (
+              <div className="py-8 text-center" role="status"><div className="update-spinner mx-auto" /><p className="mt-4 font-semibold">正在检查新版本…</p><p className="mt-1 text-sm text-[var(--dim)]">当前版本 {CURRENT_VERSION}</p></div>
+            ) : (
+              <>
+                <p className="mt-5 text-xs font-bold text-[var(--dim)]">{updateCopy.eyebrow}</p>
+                <h2 id="update-title" className="mt-1 text-2xl font-bold">{updateCopy.title}</h2>
+                <p className="mt-2 text-sm leading-6 text-[var(--dim)]">{updateCheck.data?.message ?? "点击下方按钮重新检查。"}</p>
+
+                {updateCheck.data?.latest && (
+                  <div className="mt-5 rounded-[14px] bg-[var(--soft)] px-4 py-4">
+                    <div className="flex items-center justify-between gap-3"><span className="text-sm font-semibold">版本 {updateCheck.data.latest.version}</span>{updateCheck.data.latest.published_at && <span className="text-xs text-[var(--dim)]">{new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "numeric", day: "numeric" }).format(new Date(updateCheck.data.latest.published_at))}</span>}</div>
+                    {updateCheck.data.latest.notes.length > 0 && <ul className="mt-3 space-y-2 text-sm leading-6">{updateCheck.data.latest.notes.map((item) => <li key={item} className="flex gap-2"><span className="mt-[9px] h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--accent)]" aria-hidden="true" /><span>{item}</span></li>)}</ul>}
+                  </div>
+                )}
+
+                {updateCheck.data?.status === "update_available" && updateCheck.data.latest?.apk_url ? (
+                  <>
+                    <a href={updateCheck.data.latest.apk_url} target="_blank" rel="noreferrer" className="primary-wide flex items-center justify-center gap-2"><UpdateIcon />下载安装包</a>
+                    <p className="mt-3 text-center text-xs leading-5 text-[var(--dim)]">下载完成后打开 APK，按手机提示手动安装。安装前请确认文件来自项目仓库。</p>
+                  </>
+                ) : (
+                  <button type="button" onClick={() => void updateCheck.refetch()} disabled={updateCheck.isFetching} className="primary-wide">重新检查</button>
+                )}
+                {updateCheck.data && <a href={updateCheck.data.source_url} target="_blank" rel="noreferrer" className="mt-4 block text-center text-xs font-semibold text-[var(--dim)] underline decoration-[var(--border)] underline-offset-4">查看版本仓库</a>}
+                <p className="mt-4 text-center text-[11px] text-[var(--dim)]">当前版本 {CURRENT_VERSION}</p>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {budgetOpen && (
         <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="budget-title">
@@ -524,6 +771,24 @@ export function App() {
         </div>
       )}
 
+      {settingsOpen && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="salary-settings-title">
+          <div className="glass-dialog modal-sheet">
+            <div className="modal-handle" />
+            <div className="flex items-center justify-between"><div><h2 id="salary-settings-title" className="text-xl font-bold">工资与计薪设置</h2><p className="mt-0.5 text-sm text-[var(--dim)]">用于自动计算时薪和月度工资条</p></div><button type="button" aria-label="关闭工资设置" onClick={() => setSettingsOpen(false)} className="h-10 w-10 rounded-full bg-[var(--soft)] text-xl">×</button></div>
+            <label htmlFor="base-salary" className="mt-5 block text-xs font-semibold text-[var(--dim)]">月基本工资（元）</label><input id="base-salary" inputMode="decimal" value={baseSalary} onChange={(event) => setBaseSalary(event.target.value.replace(/[^0-9.]/g, ""))} placeholder="0" className="form-control" />
+            <div className="mt-4 grid grid-cols-2 gap-3">
+              <div><label htmlFor="standard-days" className="block text-xs font-semibold text-[var(--dim)]">月计薪天数</label><input id="standard-days" inputMode="decimal" value={standardDays} onChange={(event) => setStandardDays(event.target.value.replace(/[^0-9.]/g, ""))} className="form-control" /></div>
+              <div><label htmlFor="standard-hours" className="block text-xs font-semibold text-[var(--dim)]">每日工时</label><input id="standard-hours" inputMode="decimal" value={standardHours} onChange={(event) => setStandardHours(event.target.value.replace(/[^0-9.]/g, ""))} className="form-control" /></div>
+            </div>
+            <div className="mt-4 rounded-[14px] bg-[var(--soft)] px-4 py-3"><p className="text-xs text-[var(--dim)]">自动折算时薪</p><p className="amount-font mt-1 text-xl font-bold">{Number(standardDays) > 0 && Number(standardHours) > 0 ? yuan(Math.round(Number(baseSalary || 0) * 100 / Number(standardDays) / Number(standardHours))) : "—"}</p></div>
+            <p className="mt-3 text-xs leading-5 text-[var(--dim)]">默认按月基本工资 ÷ 计薪天数 ÷ 每日工时折算。具体工资规则以单位制度和当地规定为准，可在每条记录中调整时薪与倍率。</p>
+            {saveOvertimeSettings.error && <p role="alert" className="mt-3 text-sm text-[var(--danger)]">保存失败，请稍后再试。</p>}
+            <button type="button" disabled={!settingsValid || saveOvertimeSettings.isPending} onClick={() => saveOvertimeSettings.mutate()} className="primary-wide">{saveOvertimeSettings.isPending ? "正在保存…" : "保存工资设置"}</button>
+          </div>
+        </div>
+      )}
+
       {overtimeOpen && (
         <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="overtime-title">
           <div className="glass-dialog modal-sheet max-h-[94vh] overflow-y-auto">
@@ -532,6 +797,9 @@ export function App() {
 
             <label htmlFor="work-date" className="mt-5 block text-xs font-semibold text-[var(--dim)]">日期</label>
             <input id="work-date" type="date" value={workDate} onChange={(event) => setWorkDate(event.target.value)} className="form-control" />
+
+            <p className="mt-4 text-xs font-semibold text-[var(--dim)]">加班类型与法定倍率</p>
+            <div className="mt-1 grid grid-cols-3 gap-2" aria-label="加班类型">{(["workday", "rest_day", "holiday"] as OvertimeType[]).map((type) => <button type="button" key={type} onClick={() => { setOvertimeType(type); setMultiplier(overtimeTypeInfo(type).multiplier); }} className={`rounded-[11px] px-2 py-2.5 text-xs font-bold ${overtimeType === type ? "bg-[var(--surface-strong)] shadow-sm" : "bg-[var(--soft)] text-[var(--dim)]"}`}>{overtimeTypeInfo(type).label}<span className="mt-0.5 block text-[10px] font-medium">{overtimeTypeInfo(type).multiplier} 倍</span></button>)}</div>
 
             <div className="mt-4 grid grid-cols-2 gap-2 rounded-[14px] bg-[var(--soft)] p-1" aria-label="工时填写方式">
               <button type="button" onClick={() => setDurationMode("clock")} className={`rounded-[11px] py-2.5 text-sm font-bold ${durationMode === "clock" ? "bg-[var(--surface-strong)] shadow-sm" : "text-[var(--dim)]"}`}>按起止时间</button>
@@ -558,14 +826,19 @@ export function App() {
             </div>
 
             {compensationType === "pay" && <div className="mt-4 grid grid-cols-2 gap-3">
-              <div><label htmlFor="hourly-rate" className="block text-xs font-semibold text-[var(--dim)]">时薪（元）</label><input id="hourly-rate" inputMode="decimal" value={hourlyRate} onChange={(event) => setHourlyRate(event.target.value.replace(/[^0-9.]/g, ""))} placeholder="0" className="form-control" /></div>
-              <div><label htmlFor="multiplier" className="block text-xs font-semibold text-[var(--dim)]">倍率</label><select id="multiplier" value={multiplier} onChange={(event) => setMultiplier(event.target.value)} className="form-control"><option value="1">1 倍</option><option value="1.5">1.5 倍</option><option value="2">2 倍</option><option value="3">3 倍</option></select></div>
+              <div><label htmlFor="hourly-rate" className="block text-xs font-semibold text-[var(--dim)]">计薪时薪（元）</label><input id="hourly-rate" inputMode="decimal" value={hourlyRate} onChange={(event) => setHourlyRate(event.target.value.replace(/[^0-9.]/g, ""))} placeholder="先在工资设置中填写底薪" className="form-control" /></div>
+              <div><label htmlFor="multiplier" className="block text-xs font-semibold text-[var(--dim)]">倍率（可调整）</label><select id="multiplier" value={multiplier} onChange={(event) => setMultiplier(event.target.value)} className="form-control"><option value="1">1 倍</option><option value="1.5">1.5 倍</option><option value="2">2 倍</option><option value="3">3 倍</option></select></div>
             </div>}
+
+            <div className="mt-4 grid grid-cols-2 gap-3">
+              <div><label htmlFor="allowance-amount" className="block text-xs font-semibold text-[var(--dim)]">补贴（元）</label><input id="allowance-amount" inputMode="decimal" value={allowanceAmount} onChange={(event) => setAllowanceAmount(event.target.value.replace(/[^0-9.]/g, ""))} placeholder="0" className="form-control" /></div>
+              <div><label htmlFor="deduction-amount" className="block text-xs font-semibold text-[var(--dim)]">扣款（元）</label><input id="deduction-amount" inputMode="decimal" value={deductionAmount} onChange={(event) => setDeductionAmount(event.target.value.replace(/[^0-9.]/g, ""))} placeholder="0" className="form-control" /></div>
+            </div>
 
             <label htmlFor="overtime-status" className="mt-4 block text-xs font-semibold text-[var(--dim)]">处理状态</label>
             <select id="overtime-status" value={overtimeStatus} onChange={(event) => setOvertimeStatus(event.target.value as OvertimeStatus)} className="form-control"><option value="pending">待处理</option><option value="settled">{compensationType === "pay" ? "已结算" : "已调休"}</option></select>
 
-            <div className="mt-5 flex items-center justify-between rounded-[14px] bg-[var(--soft)] px-4 py-3"><span className="text-sm text-[var(--dim)]">{compensationType === "pay" ? "预计金额" : "可调休时长"}</span><strong className="amount-font text-xl">{compensationType === "pay" ? yuan(projectedPay) : formatMinutes(Math.max(0, calculatedMinutes))}</strong></div>
+            <div className="mt-5 flex items-center justify-between rounded-[14px] bg-[var(--soft)] px-4 py-3"><span className="text-sm text-[var(--dim)]">{compensationType === "pay" ? "本次预计入账" : "可调休时长"}</span><strong className="amount-font text-xl">{compensationType === "pay" ? yuan(projectedPay + Math.round(Number(allowanceAmount || 0) * 100) - Math.round(Number(deductionAmount || 0) * 100)) : formatMinutes(Math.max(0, calculatedMinutes))}</strong></div>
             {saveOvertime.error && <p role="alert" className="mt-3 text-sm text-[var(--danger)]">保存失败，请检查填写内容。</p>}
             <button type="button" disabled={!overtimeValid || !workDate || saveOvertime.isPending} onClick={() => saveOvertime.mutate()} className="primary-wide">{saveOvertime.isPending ? "正在保存…" : editingOvertimeId == null ? "保存加班记录" : "保存修改"}</button>
           </div>
